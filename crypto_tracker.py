@@ -2,29 +2,34 @@ import streamlit as st
 import requests
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime
+import time
 
-# ---------------------------
-# CONFIG
-# ---------------------------
 st.set_page_config(page_title="Crypto Portfolio Tracker", layout="wide")
 
-# ---------------------------
-# DARK / LIGHT MODE TOGGLE
-# ---------------------------
-theme = st.sidebar.radio("Select Theme", ["Light Mode", "Dark Mode"])
+# =========================
+# THEME TOGGLE
+# =========================
+theme = st.sidebar.radio("Theme", ["Light Mode", "Dark Mode"])
 
-if theme == "Dark Mode":
-    st.markdown("""
-        <style>
-        body { background-color: #0e1117; color: white; }
-        </style>
-    """, unsafe_allow_html=True)
+plotly_template = "plotly_dark" if theme == "Dark Mode" else "plotly_white"
 
-# ---------------------------
-# FETCH LIVE CRYPTO DATA
-# ---------------------------
-@st.cache_data(ttl=60)
+# =========================
+# SAFE API FETCH WITH RETRY
+# =========================
+def fetch_with_retry(url, params=None, retries=3, timeout=10):
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, params=params, timeout=timeout)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException:
+            time.sleep(1)
+    return None
+
+# =========================
+# GET MARKET DATA
+# =========================
+@st.cache_data(ttl=120)
 def get_crypto_prices():
     url = "https://api.coingecko.com/api/v3/coins/markets"
     params = {
@@ -34,100 +39,133 @@ def get_crypto_prices():
         "page": 1,
         "sparkline": False
     }
-    response = requests.get(url, params=params)
-    return pd.DataFrame(response.json())
 
-# ---------------------------
-# HISTORICAL DATA
-# ---------------------------
+    data = fetch_with_retry(url, params)
+
+    if data and isinstance(data, list):
+        df = pd.DataFrame(data)
+        return df
+
+    return pd.DataFrame()
+
+# =========================
+# GET HISTORICAL DATA
+# =========================
 @st.cache_data(ttl=300)
-def get_historical_data(coin_id, days=7):
+def get_historical_data(coin_id, days):
     url = f"https://api.coingecko.com/api/v3/coins/{coin_id}/market_chart"
     params = {"vs_currency": "usd", "days": days}
-    response = requests.get(url, params=params)
-    data = response.json()
-    prices = data["prices"]
-    df = pd.DataFrame(prices, columns=["timestamp", "price"])
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    return df
 
-# ---------------------------
-# LOAD DATA
-# ---------------------------
+    data = fetch_with_retry(url, params)
+
+    if data and "prices" in data:
+        df = pd.DataFrame(data["prices"], columns=["timestamp", "price"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        return df
+
+    return pd.DataFrame()
+
+# =========================
+# LOAD DATA SAFELY
+# =========================
 crypto_df = get_crypto_prices()
 
-st.title("📊 Crypto Portfolio Tracker")
+if crypto_df.empty or "name" not in crypto_df.columns:
+    st.error("⚠ Unable to load crypto data. API may be temporarily unavailable.")
+    st.stop()
 
-# ---------------------------
-# PORTFOLIO INPUT
-# ---------------------------
-st.sidebar.header("Your Portfolio")
+# =========================
+# APP TITLE
+# =========================
+st.title("📊 Crypto Portfolio Tracker (Production Safe)")
 
-selected_coins = st.sidebar.multiselect(
-    "Select Cryptos",
-    crypto_df["name"].tolist()
-)
+# =========================
+# PORTFOLIO SECTION
+# =========================
+st.sidebar.header("💼 Your Portfolio")
 
-portfolio = []
+coin_names = crypto_df["name"].tolist()
+
+selected_coins = st.sidebar.multiselect("Select Coins", coin_names)
+
+portfolio_data = []
+total_value = 0
 
 for coin in selected_coins:
-    amount = st.sidebar.number_input(f"Amount of {coin}", min_value=0.0, step=0.01)
-    portfolio.append((coin, amount))
+    amount = st.sidebar.number_input(
+        f"Amount of {coin}",
+        min_value=0.0,
+        step=0.01,
+        key=coin
+    )
 
-# ---------------------------
-# PORTFOLIO VALUE CALCULATION
-# ---------------------------
-total_value = 0
-portfolio_table = []
+    coin_row = crypto_df.loc[crypto_df["name"] == coin]
 
-for coin, amount in portfolio:
-    price = crypto_df.loc[crypto_df["name"] == coin, "current_price"].values[0]
-    value = amount * price
-    total_value += value
+    if not coin_row.empty:
+        price = coin_row["current_price"].values[0]
+        value = amount * price
+        total_value += value
 
-    portfolio_table.append({
-        "Coin": coin,
-        "Amount": amount,
-        "Current Price ($)": price,
-        "Value ($)": round(value, 2)
-    })
+        portfolio_data.append({
+            "Coin": coin,
+            "Amount": amount,
+            "Price ($)": price,
+            "Value ($)": round(value, 2)
+        })
 
-if portfolio_table:
-    st.subheader("💼 Portfolio Overview")
-    st.dataframe(pd.DataFrame(portfolio_table))
-    st.metric("Total Portfolio Value ($)", round(total_value, 2))
+if portfolio_data:
+    st.subheader("📌 Portfolio Overview")
+    st.dataframe(pd.DataFrame(portfolio_data), use_container_width=True)
+    st.metric("Total Portfolio Value ($)", f"{round(total_value, 2):,}")
 
-# ---------------------------
-# PRICE PATTERN ANALYSIS
-# ---------------------------
+# =========================
+# PRICE ANALYSIS SECTION
+# =========================
 st.subheader("📈 Price Pattern Analysis")
 
-coin_choice = st.selectbox("Choose a coin for analysis", crypto_df["id"])
+coin_choice = st.selectbox("Select Coin for Analysis", crypto_df["id"])
 
 timeframe = st.radio("Timeframe", ["1 Day", "7 Days"])
 
 days = 1 if timeframe == "1 Day" else 7
 
-hist_data = get_historical_data(coin_choice, days=days)
+hist_df = get_historical_data(coin_choice, days)
 
-fig = go.Figure()
-fig.add_trace(go.Scatter(
-    x=hist_data["timestamp"],
-    y=hist_data["price"],
-    mode="lines",
-    name="Price"
-))
+if not hist_df.empty:
 
-fig.update_layout(
-    title=f"{coin_choice.capitalize()} Price Trend ({timeframe})",
-    xaxis_title="Time",
-    yaxis_title="Price (USD)",
-    template="plotly_dark" if theme == "Dark Mode" else "plotly_white"
-)
+    fig = go.Figure()
 
-st.plotly_chart(fig, use_container_width=True)
+    fig.add_trace(go.Scatter(
+        x=hist_df["timestamp"],
+        y=hist_df["price"],
+        mode="lines",
+        name="Price"
+    ))
 
-# ---------------------------
-# AUTO REFRESH
-# ---------------------------
-st.caption("🔄 Prices auto-refresh every 60 seconds")
+    # Add simple moving average for pattern visibility
+    hist_df["SMA"] = hist_df["price"].rolling(window=10).mean()
+
+    fig.add_trace(go.Scatter(
+        x=hist_df["timestamp"],
+        y=hist_df["SMA"],
+        mode="lines",
+        name="Moving Avg",
+        line=dict(dash="dash")
+    ))
+
+    fig.update_layout(
+        template=plotly_template,
+        title=f"{coin_choice.capitalize()} Price Trend ({timeframe})",
+        xaxis_title="Time",
+        yaxis_title="Price (USD)"
+    )
+
+    st.plotly_chart(fig, use_container_width=True)
+
+else:
+    st.warning("Historical data unavailable for this coin.")
+
+# =========================
+# AUTO REFRESH INFO
+# =========================
+st.caption("🔄 Data refreshes every 2 minutes. If data fails, refresh the page.")
